@@ -1,0 +1,14 @@
+flowchart TB
+    HS[HTTP headers, then HTTP 200]
+    HS --> SOCK[Same TLS socket stays open]
+
+    SOCK --> UP[Client envelopes]
+    SOCK --> DOWN[Camera envelopes]
+
+    UP --> PREVIEW[start preview]
+    UP --> ACK[ack every 25 video parts]
+    UP --> BEAT[heartbeat every 20 seconds]
+
+    DOWN --> JSON[JSON control, including session id]
+    DOWN --> TS[video/mp2t MPEG-TS]
+    TS --> FF[ffplay]

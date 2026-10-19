@@ -1,0 +1,23 @@
+sequenceDiagram
+    autonumber
+    participant App as tapo_view.py
+    participant Acct as Account server
+    participant Cipc as cipc API
+    participant Relay as Relay :443
+    participant FF as ffplay
+
+    App->>Acct: saved token, or login
+    App->>Acct: service URL for cipc.api.cloud
+    App->>Cipc: POST /v2/relay/request
+    Cipc-->>App: relay host and relayToken
+    App->>Relay: POST /relayservice, huge Content-Length
+    Relay-->>App: HTTP 200, socket stays open
+    App->>Relay: preview envelope
+    Relay-->>App: JSON session, then video envelopes
+    App->>FF: MPEG-TS bytes only
+    loop every 25 video parts
+        App->>Relay: stream_sequence ack
+    end
+    loop every 20 seconds
+        App->>Relay: heartbeat
+    end

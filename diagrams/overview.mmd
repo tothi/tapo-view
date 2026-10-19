@@ -1,0 +1,13 @@
+flowchart LR
+    CLI[tapo_view.py]
+    Acct[Account server]
+    Cipc[cipc API]
+    Relay[Relay on port 443]
+    Cam[Camera]
+    FF[ffplay]
+
+    CLI -->|login and camera list| Acct
+    CLI -->|ask for a relay| Cipc
+    CLI -->|one TLS connection stays open| Relay
+    Relay --- Cam
+    CLI -->|MPEG-TS only| FF
