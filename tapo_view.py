@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""View a Tapo camera live stream through TP-Link's cloud relay.
+"""View and pan a Tapo camera through TP-Link's cloud.
 
 Reimplemented from the official Android app (com.tplink.iot 3.21.114):
 account login is POST /api/v2/account/login, the camera list comes from
 /api/v2/common/getDeviceListByPage, the relay session from
 {cipc}/v2/relay/request, and video is multipart MPEG-TS on that relay.
+Pan and tilt go to the IoT app server as a passthrough, and only when the
+camera reports a ptz component.
 
 The password is read from a hidden prompt unless --password is passed.
 A successful login is saved and reused until the server rejects the token.
@@ -376,20 +378,202 @@ def choose_camera(devices: list[dict], name: str | None, device_id: str | None) 
     raise SystemExit("more than one camera; pass --name or --id")
 
 
-def cipc_url(base: str, token: str) -> str:
+def service_url(base: str, token: str, service_id: str) -> str:
     data = api(
         base,
         "/api/v2/common/getAppServiceUrl",
-        {"serviceIds": ["cipc.api.cloud"]},
+        {"serviceIds": [service_id]},
         token,
     )
     if data.get("error_code", 0) != 0:
-        raise SystemExit(f"service url failed: {data}")
+        raise SystemExit(f"service url failed: {data.get('msg') or data.get('error_code')}")
     urls = (data.get("result") or {}).get("serviceUrls") or {}
-    url = urls.get("cipc.api.cloud")
+    url = urls.get(service_id)
     if not url:
-        raise SystemExit(f"no cipc.api.cloud url in {data}")
+        raise SystemExit(f"no {service_id} url")
     return normalize_url(url)
+
+
+def cipc_url(base: str, token: str) -> str:
+    return service_url(base, token, "cipc.api.cloud")
+
+
+def iot_headers(token: str) -> dict[str, str]:
+    # The thing cloud wants the account token as "ut|<token>" and app-cid as
+    # "app:<app type>:<terminal uuid>". A bare token is rejected as a bad format.
+    term = terminal_uuid()
+    return {
+        "Authorization": f"ut|{token}",
+        "app-cid": f"app:{APP_TYPE}:{term}",
+        "x-app-name": APP_TYPE,
+        "x-app-version": APP_VERSION,
+        "x-term-id": term,
+        "x-ospf": "Android 14",
+        "x-net-type": "wifi",
+        "x-strict": "0",
+        "x-locale": "en_US",
+    }
+
+
+def thing_components(app: str, token: str, device_id: str) -> set[str]:
+    response = SESSION.get(
+        f"{app}/v1/things/{device_id}/components",
+        headers=iot_headers(token),
+        timeout=30,
+    )
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise SystemExit(f"component list failed: HTTP {response.status_code}") from exc
+    if response.status_code != 200:
+        raise SystemExit(f"component list failed: {data.get('message') or response.status_code}")
+    found = set()
+    for item in data.get("component_list") or []:
+        if isinstance(item, dict) and item.get("id"):
+            found.add(str(item["id"]))
+    return found
+
+
+def camera_request(app: str, token: str, device_id: str, method: str, params: dict) -> dict:
+    # The app wraps one camera call in multipleRequest, then posts it as the
+    # passthrough service on the IoT app server. services-sync returns the
+    # camera's reply; the plain services path only returns a request id.
+    body = {
+        "serviceId": "passthrough",
+        "inputParams": {
+            "requestData": {
+                "method": "multipleRequest",
+                "params": {"requests": [{"method": method, "params": params}]},
+            }
+        },
+    }
+    response = SESSION.post(
+        f"{app}/v1/things/{device_id}/services-sync",
+        headers={**iot_headers(token), "Content-Type": "application/json;charset=UTF-8"},
+        data=json.dumps(body, separators=(",", ":")).encode(),
+        timeout=30,
+    )
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise SystemExit(f"{method} failed: HTTP {response.status_code}") from exc
+    if response.status_code != 200:
+        raise SystemExit(f"{method} failed: {data.get('message') or response.status_code}")
+    output = (data.get("outputParams") or {}).get("responseData") or {}
+    result = output.get("result") if isinstance(output, dict) else None
+    responses = result.get("responses") if isinstance(result, dict) else None
+    if not responses:
+        raise SystemExit(f"{method} failed")
+    item = responses[0]
+    code = item.get("error_code", 0)
+    if code not in (0, None):
+        raise SystemExit(f"camera rejected {method}: {code}")
+    payload = item.get("result")
+    return payload if isinstance(payload, dict) else {}
+
+
+# Positive x is right and positive y is up, the same axes motorMove uses.
+PTZ_STEPS = {
+    "left": (-1, 0),
+    "right": (1, 0),
+    "up": (0, 1),
+    "down": (0, -1),
+}
+PTZ_ACTIONS = ("left", "right", "up", "down", "stop", "presets", "goto", "cruise", "cruise-stop")
+
+
+def preset_rows(result: dict) -> list[tuple[str, str]]:
+    preset = (result.get("preset") or {}).get("preset")
+    if isinstance(preset, list):
+        rows = []
+        for item in preset:
+            if isinstance(item, dict):
+                rows.append((str(item.get("id", "")), str(item.get("name", ""))))
+        return rows
+    if isinstance(preset, dict):
+        ids = preset.get("id") or []
+        names = preset.get("name") or []
+        if isinstance(ids, list):
+            rows = []
+            for index, ident in enumerate(ids):
+                name = names[index] if isinstance(names, list) and index < len(names) else ""
+                rows.append((str(ident), str(name)))
+            return rows
+    return []
+
+
+def run_ptz(base: str, token: str, devices: list[dict], args: argparse.Namespace) -> None:
+    action = args.action
+    if action not in PTZ_ACTIONS:
+        names = ", ".join(PTZ_ACTIONS)
+        raise SystemExit(f"ptz action must be one of: {names}")
+    if action in ("goto", "cruise") and not args.target:
+        raise SystemExit(f"ptz {action} needs a value")
+    if action not in ("goto", "cruise") and args.target:
+        raise SystemExit(f"ptz {action} does not take a value")
+    device = choose_camera(devices, args.name, args.id)
+    alias = device.get("alias") or device.get("deviceName") or device.get("deviceModel") or "camera"
+    app = service_url(base, token, "nbu.iot-app-server.app-v2")
+    components = thing_components(app, token, device["deviceId"])
+    if "ptz" not in components:
+        raise SystemExit(f"{alias} does not support pan and tilt")
+    device_id = device["deviceId"]
+    if action in PTZ_STEPS:
+        if args.step <= 0:
+            raise SystemExit("--step must be a positive number")
+        sx, sy = PTZ_STEPS[action]
+        camera_request(
+            app,
+            token,
+            device_id,
+            "motorMove",
+            {"motor": {"move": {"x_coord": str(sx * args.step), "y_coord": str(sy * args.step)}}},
+        )
+        log(f"moved {alias} {action} by {args.step}")
+        return
+    if action == "stop":
+        camera_request(app, token, device_id, "stopMove", {"motor": {"stop": "null"}})
+        log(f"stopped {alias}")
+        return
+    if action == "presets":
+        rows = preset_rows(camera_request(
+            app,
+            token,
+            device_id,
+            "getPresetConfig",
+            {"preset": {"name": ["preset"]}},
+        ))
+        if not rows:
+            log(f"{alias} has no presets")
+            return
+        for ident, name in rows:
+            print(f"{ident}\t{name}")
+        return
+    if action == "goto":
+        camera_request(
+            app,
+            token,
+            device_id,
+            "motorMoveToPreset",
+            {"preset": {"goto_preset": {"id": str(args.target)}}},
+        )
+        log(f"moved {alias} to preset {args.target}")
+        return
+    if action == "cruise":
+        axis = args.target
+        if axis not in ("x", "y"):
+            raise SystemExit("ptz cruise needs x (pan) or y (tilt)")
+        camera_request(
+            app,
+            token,
+            device_id,
+            "cruiseMove",
+            {"motor": {"cruise": {"coord": axis}}},
+        )
+        log(f"{alias} cruising on {axis}; ptz cruise-stop to end it")
+        return
+    camera_request(app, token, device_id, "cruiseStop", {"motor": {"cruise_stop": "null"}})
+    log(f"stopped cruise on {alias}")
 
 
 def request_relay(cipc: str, token: str, device: dict, resolution: str) -> dict:
@@ -459,6 +643,46 @@ def multipart_part(payload: str, extra_headers: dict[str, str] | None = None) ->
     return text.encode()
 
 
+def microphone(base: str, token: str, device: dict) -> tuple[str, int, int]:
+    # The relay already carries the mic as a private MPEG-TS track. The camera
+    # tells us the codec: these models send G.711, which ffplay can play raw.
+    alias = device.get("alias") or device.get("deviceModel") or "camera"
+    app = service_url(base, token, "nbu.iot-app-server.app-v2")
+    if "audio" not in thing_components(app, token, device["deviceId"]):
+        raise SystemExit(f"{alias} does not support audio")
+    result = camera_request(
+        app,
+        token,
+        device["deviceId"],
+        "getAudioConfig",
+        {
+            "audio_config": {"name": ["speaker", "microphone"]},
+            "audio_capability": {"name": ["device_microphone"]},
+        },
+    )
+    mic = ((result.get("audio_config") or {}).get("microphone") or {})
+    formats = {"G711alaw": "alaw", "G711ulaw": "mulaw"}
+    encode = str(mic.get("encode_type") or "")
+    fmt = formats.get(encode)
+    if not fmt:
+        raise SystemExit(f"{alias} audio codec {encode or 'unknown'} cannot be played")
+    try:
+        rate = int(str(mic.get("sampling_rate") or "8"))
+    except ValueError:
+        rate = 8
+    if rate < 1000:
+        rate *= 1000
+    try:
+        channels = int(str(mic.get("channels") or "1"))
+    except ValueError:
+        channels = 1
+    if mic.get("mute") == "on":
+        log(f"{alias} microphone is muted")
+    if str(mic.get("volume") or "0") in ("0", "0.0"):
+        log(f"{alias} microphone volume is 0, so the stream may be silent")
+    return fmt, rate, channels
+
+
 def preview_payload(resolution: str) -> str:
     return json.dumps(
         {
@@ -505,14 +729,22 @@ def relay_headers(host: str, port: int, path: str, relay: dict, client_uuid: str
 
 
 class MpegTsWriter:
-    def __init__(self, play: bool) -> None:
+    def __init__(self, play: bool, audio: tuple[str, int, int] | None = None, rewrite_sei: bool = False) -> None:
         self.play = play
+        self.rewrite_sei = rewrite_sei
         self.process: subprocess.Popen[bytes] | None = None
+        self.audio_process: subprocess.Popen[bytes] | None = None
         self.failed = False
+        self._ts = b""
+        self._pes = b""
+        self._audio_pid: int | None = None
+        self._sei_rest = b""
+        self._sei_carry = b""
+        self._video_pid: int | None = None
         if play:
             # A short probe opens the window as soon as the first frames arrive.
-            # The camera's timestamps start far from zero, so sync to video
-            # instead of the unknown audio track.
+            # The camera's timestamps start far from zero, so sync to video.
+            # Its microphone is a private stream type, pulled out separately.
             self.process = subprocess.Popen(
                 [
                     "ffplay",
@@ -537,9 +769,50 @@ class MpegTsWriter:
                 ],
                 stdin=subprocess.PIPE,
             )
+        if audio is not None:
+            fmt, rate, channels = audio
+            layout = "mono" if channels == 1 else "stereo"
+            self.audio_process = subprocess.Popen(
+                [
+                    "ffplay",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-nodisp",
+                    "-fflags",
+                    "nobuffer",
+                    "-flags",
+                    "low_delay",
+                    "-probesize",
+                    "32",
+                    "-analyzeduration",
+                    "0",
+                    "-f",
+                    fmt,
+                    "-sample_rate",
+                    str(rate),
+                    "-ch_layout",
+                    layout,
+                    "-i",
+                    "pipe:0",
+                ],
+                stdin=subprocess.PIPE,
+            )
 
     def write(self, data: bytes) -> None:
         if self.failed:
+            return
+        if self.audio_process is not None:
+            self._demux_audio(data)
+        # Some cameras put a private SEI in every H.264 frame. libavcodec logs
+        # the short payload as an error. Filler NALs are skipped, and the picture
+        # does not use this SEI. Off unless --rewrite-sei is set.
+        if self.rewrite_sei:
+            data = self._silence_sei(data)
+        self._write_out(data)
+
+    def _write_out(self, data: bytes) -> None:
+        if not data or self.failed:
             return
         if self.process is not None and self.process.stdin is not None:
             try:
@@ -554,13 +827,111 @@ class MpegTsWriter:
         except BrokenPipeError:
             self.failed = True
 
+    def _silence_sei(self, data: bytes) -> bytes:
+        blob = self._sei_rest + data
+        whole = len(blob) - (len(blob) % 188)
+        self._sei_rest = blob[whole:]
+        if whole == 0:
+            return b""
+        out = bytearray(blob[:whole])
+        for at in range(0, whole, 188):
+            packet = out[at : at + 188]
+            if packet[0] != 0x47:
+                continue
+            pid = ((packet[1] & 0x1F) << 8) | packet[2]
+            start = bool(packet[1] & 0x40)
+            adapt = (packet[3] >> 4) & 0x3
+            offset = 4
+            if adapt & 0x2:
+                if offset >= len(packet):
+                    continue
+                offset += 1 + packet[4]
+            if offset > len(packet):
+                continue
+            if self._video_pid is None:
+                body = bytes(packet[offset:])
+                if start and len(body) >= 4 and body.startswith(b"\x00\x00\x01") and 0xE0 <= body[3] <= 0xEF:
+                    self._video_pid = pid
+                else:
+                    continue
+            if pid != self._video_pid:
+                continue
+            payload = bytes(out[at + offset : at + 188])
+            merged = self._sei_carry + payload
+            carry_len = len(self._sei_carry)
+            index = 0
+            while True:
+                found = merged.find(b"\x00\x00\x01", index)
+                if found < 0:
+                    break
+                header_at = found + 3
+                if header_at >= carry_len and header_at < len(merged):
+                    header = merged[header_at]
+                    if header & 0x1F == 6:
+                        out[at + offset + header_at - carry_len] = (header & 0xE0) | 12
+                index = found + 3
+            self._sei_carry = merged[-3:] if len(merged) >= 3 else merged
+        return bytes(out)
+
+    def _demux_audio(self, data: bytes) -> None:
+        self._ts += data
+        while len(self._ts) >= 188:
+            if self._ts[0] != 0x47:
+                sync = self._ts.find(b"\x47", 1)
+                self._ts = b"" if sync < 0 else self._ts[sync:]
+                continue
+            packet, self._ts = self._ts[:188], self._ts[188:]
+            pid = ((packet[1] & 0x1F) << 8) | packet[2]
+            start = bool(packet[1] & 0x40)
+            adapt = (packet[3] >> 4) & 0x3
+            offset = 4
+            if adapt & 0x2:
+                if offset >= len(packet):
+                    continue
+                offset += 1 + packet[4]
+            if offset > len(packet):
+                continue
+            body = packet[offset:]
+            if self._audio_pid is None:
+                if start and len(body) >= 4 and body.startswith(b"\x00\x00\x01") and 0xC0 <= body[3] <= 0xDF:
+                    self._audio_pid = pid
+                else:
+                    continue
+            if pid != self._audio_pid:
+                continue
+            if start:
+                self._flush_audio()
+            self._pes += body
+
+    def _flush_audio(self) -> None:
+        pes, self._pes = self._pes, b""
+        if len(pes) < 9 or not pes.startswith(b"\x00\x00\x01"):
+            return
+        header = pes[8]
+        payload = pes[9 + header :]
+        process = self.audio_process
+        if not payload or process is None or process.stdin is None:
+            return
+        try:
+            process.stdin.write(payload)
+            process.stdin.flush()
+        except BrokenPipeError:
+            self.audio_process = None
+
     def close(self) -> None:
-        if self.process is not None and self.process.stdin is not None:
+        self._flush_audio()
+        tail = self._sei_rest
+        self._sei_rest = b""
+        if tail and not self.failed:
+            self._write_out(tail)
+        for process in (self.process, self.audio_process):
+            if process is None or process.stdin is None:
+                continue
             try:
-                self.process.stdin.close()
+                process.stdin.close()
             except BrokenPipeError:
                 pass
-            self.process.wait()
+            process.wait()
 
 
 def read_http_head(sock: ssl.SSLSocket) -> tuple[int, dict[str, str], bytes]:
@@ -689,13 +1060,19 @@ def stream_relay(relay: dict, resolution: str, output: MpegTsWriter) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Play a Tapo cloud live stream")
-    parser.add_argument("command", choices=("list", "play"))
+    parser = argparse.ArgumentParser(description="Play a Tapo cloud live stream, or pan and tilt a camera that supports it")
+    parser.add_argument("command", choices=("list", "play", "ptz"))
+    parser.add_argument("action", nargs="?", help="ptz: left, right, up, down, stop, presets, goto, cruise, cruise-stop")
+    parser.add_argument("target", nargs="?", help="preset id for goto, or x/y for cruise")
     parser.add_argument("--email", default=os.environ.get("TAPO_EMAIL", ""), help="account email; remembered with the session")
     parser.add_argument("--password", help="omit this to type the password at a hidden prompt; skipped while the saved session is valid")
     parser.add_argument("--name", help="camera alias substring")
     parser.add_argument("--id", help="camera deviceId")
     parser.add_argument("--resolution", choices=("HD", "VGA"), default="HD")
+    parser.add_argument("--step", type=int, default=10, help="pan/tilt distance for left, right, up, and down")
+    parser.add_argument("--detailed", action="store_true", help="with list, add a column for whether the camera can pan and tilt")
+    parser.add_argument("--audio", action="store_true", help="with play, also play the camera microphone when the camera supports it")
+    parser.add_argument("--rewrite-sei", action="store_true", help="with play, rewrite the camera's private H.264 SEI so ffplay does not log a truncation error per frame")
     parser.add_argument("--mfa", help="two-step code; if omitted, you are prompted after it is sent")
     parser.add_argument(
         "--stdout",
@@ -703,6 +1080,16 @@ def main() -> None:
         help="write MPEG-TS to stdout instead of launching ffplay",
     )
     args = parser.parse_args()
+    if args.command != "ptz" and (args.action or args.target):
+        parser.error("extra arguments are only used with ptz")
+    if args.detailed and args.command != "list":
+        parser.error("--detailed is only used with list")
+    if args.audio and args.command != "play":
+        parser.error("--audio is only used with play")
+    if args.rewrite_sei and args.command != "play":
+        parser.error("--rewrite-sei is only used with play")
+    if args.audio and args.stdout:
+        parser.error("--audio plays through ffplay; leave out --stdout")
     try:
         _email, base, token = open_session(args.email, args.password, args.mfa)
         devices = cameras(base, token)
@@ -715,9 +1102,32 @@ def main() -> None:
         if not devices:
             log("no cameras on this account")
             return
+        ptz_of: dict[str, bool | None] | None = None
+        if args.detailed:
+            app = service_url(base, token, "nbu.iot-app-server.app-v2")
+            ptz_of = {}
+            for device in devices:
+                device_id = str(device.get("deviceId") or "")
+                label = device.get("alias") or device.get("deviceModel") or "camera"
+                try:
+                    ptz_of[device_id] = "ptz" in thing_components(app, token, device_id)
+                except SystemExit as exc:
+                    log(f"{label}: {exc}")
+                    ptz_of[device_id] = None
+        header = "deviceId\tmodel\talias"
+        if ptz_of is not None:
+            header += "\tptz"
+        print(header)
         for device in devices:
             alias = device.get("alias") or device.get("deviceName") or ""
-            print(f"{device.get('deviceId')}\t{device.get('deviceModel') or ''}\t{alias}")
+            row = f"{device.get('deviceId')}\t{device.get('deviceModel') or ''}\t{alias}"
+            if ptz_of is not None:
+                cell = {True: "yes", False: "no"}.get(ptz_of.get(str(device.get("deviceId") or "")), "?")
+                row += f"\t{cell}"
+            print(row)
+        return
+    if args.command == "ptz":
+        run_ptz(base, token, devices, args)
         return
 
     device = choose_camera(devices, args.name, args.id)
@@ -727,9 +1137,13 @@ def main() -> None:
     play = not args.stdout and sys.stdout.isatty()
     if play and shutil.which("ffplay") is None:
         raise SystemExit("ffplay is not installed; re-run with --stdout and pipe it yourself")
+    audio = None
+    if args.audio:
+        audio = microphone(base, token, device)
+        log(f"playing microphone ({audio[0]}, {audio[1]} Hz)")
     if play:
         log("opening ffplay")
-    output = MpegTsWriter(play)
+    output = MpegTsWriter(play, audio, args.rewrite_sei)
     try:
         stream_relay(relay, args.resolution, output)
     finally:
